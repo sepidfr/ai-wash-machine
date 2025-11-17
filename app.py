@@ -1,10 +1,11 @@
 """
-ai-laundry-sorter – Streamlit Demo (2 models)
+ai-laundry-sorter – Streamlit Demo
 
-Model A: multi-task ConvNeXt for color group, fabric group, wash program
-Model B: single-task ConvNeXt for garment type (garment_label)
+This application uses two ConvNeXt models:
+1) Multi-task model: predicts Color Group, Fabric Group, Wash Program
+2) Garment-type model: predicts Garment Type
 
-Both models are downloaded from Google Drive and used together.
+Both models are downloaded from Google Drive at runtime.
 """
 
 import os
@@ -23,31 +24,26 @@ import gdown
 
 
 # --------------------------------------------------
-# 0) Paths
+# File paths
 # --------------------------------------------------
 HERE = os.path.dirname(__file__)
 
-# Existing labels for color / fabric / wash
-LABELS_WASH_CSV = os.path.join(HERE, "wash_labels.csv")
-
-# Labels that include garment_label / garment_type
+LABELS_WASH_CSV    = os.path.join(HERE, "wash_labels.csv")
 LABELS_GARMENT_CSV = os.path.join(HERE, "wash_labels_with_garment.csv")
+HEADER_IMG         = os.path.join(HERE, "ai.jpg")
+DEMO_LOG           = os.path.join(HERE, "demo_usage_log.csv")
 
-HEADER_IMG = os.path.join(HERE, "ai.jpg")
-DEMO_LOG   = os.path.join(HERE, "demo_usage_log.csv")
+# Existing multi-task model (wash/color/fabric)
+CKPT_WASH         = os.path.join(HERE, "best_model_wash.pt")
+MODEL_URL_WASH    = "https://drive.google.com/uc?id=1Siu8S9OVwfu7v13M0ip8ucf4_CRuGUS9"
 
-# Existing multi-task wash model (already working)
-CKPT_WASH   = os.path.join(HERE, "best_model_wash.pt")
-MODEL_URL_WASH = "https://drive.google.com/uc?id=1Siu8S9OVwfu7v13M0ip8ucf4_CRuGUS9"
-
-# NEW: garment-only model
-CKPT_GARMENT   = os.path.join(HERE, "best_model_garment.pt")
-# TODO: replace THIS ID with your garment model file ID
-MODEL_URL_GARMENT = "https://drive.google.com/uc?id=YOUR_GARMENT_MODEL_ID_HERE"
+# Garment-type model
+CKPT_GARMENT      = os.path.join(HERE, "best_model_garment.pt")
+MODEL_URL_GARMENT = "https://drive.google.com/uc?id=1Siu8S9OVwfu7v13M0ip8ucf4_CRuGUS9"
 
 
 def download_if_missing(url: str, dest_path: str, label: str):
-    """Download a file from Google Drive if it does not exist."""
+    """Download a Google Drive file if it is missing."""
     if os.path.exists(dest_path):
         return
     st.write(f"Downloading {label} model from Google Drive (first run only)...")
@@ -55,7 +51,7 @@ def download_if_missing(url: str, dest_path: str, label: str):
 
 
 # --------------------------------------------------
-# 1) Label metadata
+# Load label metadata
 # --------------------------------------------------
 df_wash = pd.read_csv(LABELS_WASH_CSV)
 df_wash["color_label"]      = df_wash["color_label"].astype(int)
@@ -82,12 +78,12 @@ wash_description = {
     "normal":   "Normal – standard wash, warm water, medium spin (daily cotton & mixed clothes).",
     "heavy":    "Heavy – deep-clean cycle, hot water, high spin (jeans, towels, sportswear).",
     "quick":    "Quick – rapid wash, cool water, medium spin (lightly soiled garments).",
-    "wool":     "Wool – gentle wool cycle, cool water, very low spin (prevents shrinkage).",
+    "wool":     "Wool – wool-safe cycle, cool water, very low spin (prevents shrinkage).",
 }
 
 
 # --------------------------------------------------
-# 2) Shared transforms
+# Transforms
 # --------------------------------------------------
 IMG_SIZE = 256
 demo_transform = transforms.Compose([
@@ -105,10 +101,10 @@ device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 
 # --------------------------------------------------
-# 3) Model definitions
+# Model definitions
 # --------------------------------------------------
 class WashMultiTaskConvNeXt(nn.Module):
-    """Multi-task ConvNeXt for color, fabric, wash."""
+    """Predicts: Color Group, Fabric Group, Wash Program"""
     def __init__(self, n_color, n_fabric, n_wash):
         super().__init__()
         self.backbone = timm.create_model(
@@ -132,11 +128,7 @@ class WashMultiTaskConvNeXt(nn.Module):
 
 
 class GarmentConvNeXt(nn.Module):
-    """Single-task ConvNeXt for garment type.
-
-    This should match the architecture used when you trained `model`
-    in the notebook that produced your confusion-matrix code.
-    """
+    """Predicts Garment Type only."""
     def __init__(self, n_garment):
         super().__init__()
         self.backbone = timm.create_model(
@@ -150,41 +142,37 @@ class GarmentConvNeXt(nn.Module):
 
     def forward(self, x):
         feat = self.backbone(x)
-        logits_garment = self.head_garment(feat)
-        return logits_garment
+        return self.head_garment(feat)
 
 
 # --------------------------------------------------
-# 4) Load models
+# Load models
 # --------------------------------------------------
-# download weight files if missing
 download_if_missing(MODEL_URL_WASH,    CKPT_WASH,    "wash (color/fabric/wash)")
 download_if_missing(MODEL_URL_GARMENT, CKPT_GARMENT, "garment-type")
 
-# Multi-task wash model
 wash_model = WashMultiTaskConvNeXt(
     n_color=num_color_classes,
     n_fabric=num_fabric_classes,
     n_wash=num_wash_classes,
 ).to(device)
-state_wash = torch.load(CKPT_WASH, map_location=device)
-wash_model.load_state_dict(state_wash)
-wash_model.eval()
 
-# Garment-only model
 garment_model = GarmentConvNeXt(
     n_garment=num_garment_classes,
 ).to(device)
-state_garment = torch.load(CKPT_GARMENT, map_location=device)
-garment_model.load_state_dict(state_garment)
+
+wash_model.load_state_dict(torch.load(CKPT_WASH, map_location=device))
+garment_model.load_state_dict(torch.load(CKPT_GARMENT, map_location=device))
+
+wash_model.eval()
 garment_model.eval()
 
 
 # --------------------------------------------------
-# 5) Prediction helpers
+# Prediction
 # --------------------------------------------------
 def predict_all(pil_img: Image.Image):
-    """Run both models on a single image and return all predictions."""
+    """Return garment type + color group + fabric group + wash program."""
     x = demo_transform(pil_img).unsqueeze(0).to(device)
 
     with torch.no_grad():
@@ -210,7 +198,7 @@ def predict_all(pil_img: Image.Image):
 
 
 # --------------------------------------------------
-# 6) Streamlit UI
+# UI
 # --------------------------------------------------
 def main():
     st.set_page_config(
@@ -223,7 +211,7 @@ def main():
         st.image(HEADER_IMG, use_container_width=True)
 
     st.title("ai-laundry-sorter")
-    st.caption("Upload a garment image to get garment type and washing program.")
+    st.caption("Upload a clothing image and receive automatic washing instructions.")
 
     uploaded = st.file_uploader(
         "Upload an image (JPG or PNG)",
@@ -242,33 +230,14 @@ def main():
         result = predict_all(pil)
 
         with col2:
-            st.subheader("Prediction")
+            st.subheader("Washing Recommendation")
             st.markdown(f"**Garment Type:** {result['garment']}")
             st.markdown(f"**Color Group:** {result['color']}")
             st.markdown(f"**Fabric Group:** {result['fabric']}")
             st.markdown(f"**Wash Program:** {result['wash']}")
 
-        # optional logging
-        ts = datetime.datetime.now().isoformat(timespec="seconds")
-        row = pd.DataFrame([{
-            "timestamp": ts,
-            "file": uploaded.name,
-            "garment": result["garment"],
-            "color": result["color"],
-            "fabric": result["fabric"],
-            "wash": result["wash"],
-        }])
-        try:
-            if os.path.exists(DEMO_LOG):
-                old = pd.read_csv(DEMO_LOG)
-                pd.concat([old, row], ignore_index=True).to_csv(DEMO_LOG, index=False)
-            else:
-                row.to_csv(DEMO_LOG, index=False)
-        except Exception:
-            pass
-
     else:
-        st.info("Upload a clothing image above to see garment type and washing suggestion.")
+        st.info("Upload a clothing image above to begin.")
 
 
 if __name__ == "__main__":
