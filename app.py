@@ -1,16 +1,17 @@
 """
 ai-laundry-sorter – Streamlit Demo
 
-This application uses two ConvNeXt models:
-1) Multi-task model: predicts Color Group, Fabric Group, Wash Program
-2) Garment-type model: predicts Garment Type
+Two ConvNeXt models:
+- Wash model (multi-task): Color Group, Fabric Group, Wash Program
+- Garment model (3-class): TOP / BOTTOM / ONEPIECE
 
-Both models are downloaded from Google Drive at runtime.
+Both weights are downloaded from Google Drive.
 """
 
 import os
 import io
 import datetime
+from collections import OrderedDict
 
 import pandas as pd
 from PIL import Image
@@ -24,26 +25,28 @@ import gdown
 
 
 # --------------------------------------------------
-# File paths
+# 0) Paths (relative to repository root)
 # --------------------------------------------------
 HERE = os.path.dirname(__file__)
 
 LABELS_WASH_CSV    = os.path.join(HERE, "wash_labels.csv")
-LABELS_GARMENT_CSV = os.path.join(HERE, "wash_labels_with_garment.csv")
+LABELS_G3_CSV      = os.path.join(HERE, "wash_labels_with_garment.csv")
+
 HEADER_IMG         = os.path.join(HERE, "ai.jpg")
 DEMO_LOG           = os.path.join(HERE, "demo_usage_log.csv")
 
-# Existing multi-task model (wash/color/fabric)
-CKPT_WASH         = os.path.join(HERE, "best_model_wash.pt")
-MODEL_URL_WASH    = "https://drive.google.com/uc?id=1Siu8S9OVwfu7v13M0ip8ucf4_CRuGUS9"
+CKPT_WASH          = os.path.join(HERE, "best_model_wash.pt")
+CKPT_GARMENT_3     = os.path.join(HERE, "best_garment_3class.pt")
 
-# Garment-type model
-CKPT_GARMENT      = os.path.join(HERE, "best_model_garment.pt")
-MODEL_URL_GARMENT = "https://drive.google.com/uc?id=1Siu8S9OVwfu7v13M0ip8ucf4_CRuGUS9"
+# ✅ wash model id (this is the one you already use)
+MODEL_URL_WASH     = "https://drive.google.com/uc?id=1Siu8S9OVwfu7v13M0ip8ucf4_CRuGUS9"
+
+# ❗ TODO: put the *real* ID of best_garment_3class.pt here
+MODEL_URL_GARMENT3 = "https://drive.google.com/uc?id=YOUR_GARMENT_MODEL_ID_HERE"
 
 
 def download_if_missing(url: str, dest_path: str, label: str):
-    """Download a Google Drive file if it is missing."""
+    """Download a file from Google Drive if it is missing."""
     if os.path.exists(dest_path):
         return
     st.write(f"Downloading {label} model from Google Drive (first run only)...")
@@ -51,7 +54,7 @@ def download_if_missing(url: str, dest_path: str, label: str):
 
 
 # --------------------------------------------------
-# Load label metadata
+# 1) Label metadata
 # --------------------------------------------------
 df_wash = pd.read_csv(LABELS_WASH_CSV)
 df_wash["color_label"]      = df_wash["color_label"].astype(int)
@@ -66,28 +69,46 @@ color_map  = dict(zip(df_wash["color_label"],  df_wash["color_group"]))
 fabric_map = dict(zip(df_wash["fabric_label"], df_wash["fabric_group"]))
 wash_map   = dict(zip(df_wash["wash_cycle_label"], df_wash["wash_cycle"]))
 
-# Garment labels
-df_garment = pd.read_csv(LABELS_GARMENT_CSV)
-df_garment["garment_label"] = df_garment["garment_label"].astype(int)
+# garment 3-class mapping (TOP / BOTTOM / ONEPIECE)
+df_g3 = pd.read_csv(LABELS_G3_CSV)
+assert "garment_3class" in df_g3.columns or "g3_label" in df_g3.columns, \
+    "wash_labels_with_garment.csv must contain garment_3class/g3_label columns"
 
-num_garment_classes = df_garment["garment_label"].nunique()
-garment_map = dict(zip(df_garment["garment_label"], df_garment["garment_type"]))
+if "g3_label" in df_g3.columns:
+    df_g3["g3_label"] = df_g3["g3_label"].astype(int)
+    # we reconstruct name mapping from garment_3class if present
+    if "garment_3class" in df_g3.columns:
+        g3_map = (df_g3.drop_duplicates("g3_label")
+                        .set_index("g3_label")["garment_3class"]
+                        .to_dict())
+    else:
+        # fallback: anything that maps to the 3 labels
+        g3_map = {int(i): f"CLASS_{i}" for i in sorted(df_g3["g3_label"].unique())}
+else:
+    # If only names exist, create indices
+    df_g3["garment_3class"] = df_g3["garment_3class"].astype(str)
+    classes = sorted(df_g3["garment_3class"].unique())
+    name2idx = {c: i for i, c in enumerate(classes)}
+    df_g3["g3_label"] = df_g3["garment_3class"].map(name2idx).astype(int)
+    g3_map = {i: c for c, i in name2idx.items()}
+
+num_g3_classes = len(g3_map)
 
 wash_description = {
     "delicate": "Delicate – gentle wash, cold water, low spin (silk, lace, sensitive fabrics).",
     "normal":   "Normal – standard wash, warm water, medium spin (daily cotton & mixed clothes).",
-    "heavy":    "Heavy – deep-clean cycle, hot water, high spin (jeans, towels, sportswear).",
+    "heavy":    "Heavy – deep-clean, hot water, high spin (jeans, towels, sportswear).",
     "quick":    "Quick – rapid wash, cool water, medium spin (lightly soiled garments).",
-    "wool":     "Wool – wool-safe cycle, cool water, very low spin (prevents shrinkage).",
+    "wool":     "Wool – wool cycle, cool water, very low spin (prevents shrinkage).",
 }
 
 
 # --------------------------------------------------
-# Transforms
+# 2) Transforms
 # --------------------------------------------------
-IMG_SIZE = 256
+IMG_SIZE = 224   # to match your G3ConvNeXt training
 demo_transform = transforms.Compose([
-    transforms.Resize(IMG_SIZE + 32),
+    transforms.Resize(IMG_SIZE + 16),
     transforms.CenterCrop(IMG_SIZE),
     transforms.ToTensor(),
     transforms.Normalize(
@@ -101,10 +122,10 @@ device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 
 # --------------------------------------------------
-# Model definitions
+# 3) Model definitions – must match training
 # --------------------------------------------------
 class WashMultiTaskConvNeXt(nn.Module):
-    """Predicts: Color Group, Fabric Group, Wash Program"""
+    """Color, Fabric, Wash Program (your multitask model)."""
     def __init__(self, n_color, n_fabric, n_wash):
         super().__init__()
         self.backbone = timm.create_model(
@@ -127,52 +148,56 @@ class WashMultiTaskConvNeXt(nn.Module):
         )
 
 
-class GarmentConvNeXt(nn.Module):
-    """Predicts Garment Type only."""
-    def __init__(self, n_garment):
+class G3ConvNeXt(nn.Module):
+    """
+    EXACT copy of your training model for 3-class garment:
+    - pretrained ConvNeXt-Tiny
+    - global_pool='avg'
+    - Dropout(0.2)
+    - Linear -> 3 classes
+    """
+    def __init__(self, model_name="convnext_tiny", num_classes=3, dropout=0.2):
         super().__init__()
         self.backbone = timm.create_model(
-            BACKBONE,
-            pretrained=False,
+            model_name,
+            pretrained=True,
             num_classes=0,
             global_pool="avg",
         )
-        feat_dim = self.backbone.num_features
-        self.head_garment = nn.Linear(feat_dim, n_garment)
+        self.dropout = nn.Dropout(dropout)
+        self.fc = nn.Linear(self.backbone.num_features, num_classes)
 
     def forward(self, x):
         feat = self.backbone(x)
-        return self.head_garment(feat)
+        feat = self.dropout(feat)
+        return self.fc(feat)
 
 
 # --------------------------------------------------
-# Load models
+# 4) Load weights
 # --------------------------------------------------
-download_if_missing(MODEL_URL_WASH,    CKPT_WASH,    "wash (color/fabric/wash)")
-download_if_missing(MODEL_URL_GARMENT, CKPT_GARMENT, "garment-type")
+download_if_missing(MODEL_URL_WASH,     CKPT_WASH,     "wash (color/fabric/wash)")
+download_if_missing(MODEL_URL_GARMENT3, CKPT_GARMENT_3, "garment 3-class")
 
 wash_model = WashMultiTaskConvNeXt(
     n_color=num_color_classes,
     n_fabric=num_fabric_classes,
     n_wash=num_wash_classes,
 ).to(device)
-
-garment_model = GarmentConvNeXt(
-    n_garment=num_garment_classes,
-).to(device)
-
 wash_model.load_state_dict(torch.load(CKPT_WASH, map_location=device))
-garment_model.load_state_dict(torch.load(CKPT_GARMENT, map_location=device))
-
 wash_model.eval()
-garment_model.eval()
+
+g3_model = G3ConvNeXt(
+    num_classes=num_g3_classes,
+).to(device)
+g3_model.load_state_dict(torch.load(CKPT_GARMENT_3, map_location=device))
+g3_model.eval()
 
 
 # --------------------------------------------------
-# Prediction
+# 5) Prediction helper
 # --------------------------------------------------
 def predict_all(pil_img: Image.Image):
-    """Return garment type + color group + fabric group + wash program."""
     x = demo_transform(pil_img).unsqueeze(0).to(device)
 
     with torch.no_grad():
@@ -182,15 +207,15 @@ def predict_all(pil_img: Image.Image):
         f_idx = logits_f.argmax(1).item()
         w_idx = logits_w.argmax(1).item()
 
-        # garment model
-        logits_g = garment_model(x)
-        g_idx = logits_g.argmax(1).item()
+        # 3-class garment model
+        logits_g3 = g3_model(x)
+        g3_idx = logits_g3.argmax(1).item()
 
     wash_key  = wash_map[w_idx]
     wash_text = wash_description.get(wash_key, wash_key)
 
     return {
-        "garment": garment_map[g_idx],
+        "garment": g3_map[g3_idx],
         "color":   color_map[c_idx],
         "fabric":  fabric_map[f_idx],
         "wash":    wash_text,
@@ -198,7 +223,7 @@ def predict_all(pil_img: Image.Image):
 
 
 # --------------------------------------------------
-# UI
+# 6) Streamlit app
 # --------------------------------------------------
 def main():
     st.set_page_config(
@@ -211,7 +236,7 @@ def main():
         st.image(HEADER_IMG, use_container_width=True)
 
     st.title("ai-laundry-sorter")
-    st.caption("Upload a clothing image and receive automatic washing instructions.")
+    st.caption("Upload a clothing image to get garment type and washing instructions.")
 
     uploaded = st.file_uploader(
         "Upload an image (JPG or PNG)",
@@ -230,14 +255,33 @@ def main():
         result = predict_all(pil)
 
         with col2:
-            st.subheader("Washing Recommendation")
+            st.subheader("Prediction")
             st.markdown(f"**Garment Type:** {result['garment']}")
             st.markdown(f"**Color Group:** {result['color']}")
             st.markdown(f"**Fabric Group:** {result['fabric']}")
             st.markdown(f"**Wash Program:** {result['wash']}")
 
+        # Optional logging
+        ts = datetime.datetime.now().isoformat(timespec="seconds")
+        row = pd.DataFrame([{
+            "timestamp": ts,
+            "file": uploaded.name,
+            "garment": result["garment"],
+            "color": result["color"],
+            "fabric": result["fabric"],
+            "wash": result["wash"],
+        }])
+        try:
+            if os.path.exists(DEMO_LOG):
+                old = pd.read_csv(DEMO_LOG)
+                pd.concat([old, row], ignore_index=True).to_csv(DEMO_LOG, index=False)
+            else:
+                row.to_csv(DEMO_LOG, index=False)
+        except Exception:
+            pass
+
     else:
-        st.info("Upload a clothing image above to begin.")
+        st.info("Upload a garment image above to see the washing recommendation.")
 
 
 if __name__ == "__main__":
