@@ -4,14 +4,11 @@ ai-laundry-sorter – Streamlit Demo
 Two ConvNeXt models:
 - Wash model (multi-task): Color Group, Fabric Group, Wash Program
 - Garment model (3-class): TOP / BOTTOM / ONEPIECE
-
-Both weights are downloaded from Google Drive.
 """
 
 import os
 import io
 import datetime
-from collections import OrderedDict
 
 import pandas as pd
 from PIL import Image
@@ -24,39 +21,39 @@ import streamlit as st
 import gdown
 
 
-# --------------------------------------------------
-# 0) Paths (relative to repository root)
-# --------------------------------------------------
+# ==========================================================
+# 0) Paths (relative to repo root)
+# ==========================================================
 HERE = os.path.dirname(__file__)
 
-LABELS_WASH_CSV    = os.path.join(HERE, "wash_labels.csv")
-LABELS_G3_CSV      = os.path.join(HERE, "wash_labels_with_garment.csv")
+LABELS_WASH_CSV = os.path.join(HERE, "wash_labels.csv")
 
-HEADER_IMG         = os.path.join(HERE, "ai.jpg")
-DEMO_LOG           = os.path.join(HERE, "demo_usage_log.csv")
+HEADER_IMG      = os.path.join(HERE, "ai.jpg")
+DEMO_LOG        = os.path.join(HERE, "demo_usage_log.csv")
 
-CKPT_WASH          = os.path.join(HERE, "best_model_wash.pt")
-CKPT_GARMENT_3     = os.path.join(HERE, "best_garment_3class.pt")
+CKPT_WASH       = os.path.join(HERE, "best_model_wash.pt")
+CKPT_G3         = os.path.join(HERE, "best_garment_3class.pt")
 
-# ✅ wash model id (this is the one you already use)
-MODEL_URL_WASH     = "https://drive.google.com/uc?id=1Siu8S9OVwfu7v13M0ip8ucf4_CRuGUS9"
+# wash model (this is your existing ConvNeXt multi-task model)
+MODEL_URL_WASH  = "https://drive.google.com/uc?id=1Siu8S9OVwfu7v13M0ip8ucf4_CRuGUS9"
 
-# ❗ TODO: put the *real* ID of best_garment_3class.pt here
-MODEL_URL_GARMENT3 = "https://drive.google.com/uc?id=YOUR_GARMENT_MODEL_ID_HERE"
+# TODO: REPLACE with the ID of *best_garment_3class.pt* (not the wash model!)
+MODEL_URL_G3    = "https://drive.google.com/uc?id=YOUR_GARMENT_3CLASS_MODEL_ID"
 
 
 def download_if_missing(url: str, dest_path: str, label: str):
-    """Download a file from Google Drive if it is missing."""
+    """Download a Google Drive file if it is missing."""
     if os.path.exists(dest_path):
         return
     st.write(f"Downloading {label} model from Google Drive (first run only)...")
     gdown.download(url, dest_path, quiet=False)
 
 
-# --------------------------------------------------
-# 1) Label metadata
-# --------------------------------------------------
+# ==========================================================
+# 1) Load wash labels (color / fabric / wash)
+# ==========================================================
 df_wash = pd.read_csv(LABELS_WASH_CSV)
+
 df_wash["color_label"]      = df_wash["color_label"].astype(int)
 df_wash["fabric_label"]     = df_wash["fabric_label"].astype(int)
 df_wash["wash_cycle_label"] = df_wash["wash_cycle_label"].astype(int)
@@ -69,44 +66,35 @@ color_map  = dict(zip(df_wash["color_label"],  df_wash["color_group"]))
 fabric_map = dict(zip(df_wash["fabric_label"], df_wash["fabric_group"]))
 wash_map   = dict(zip(df_wash["wash_cycle_label"], df_wash["wash_cycle"]))
 
-# garment 3-class mapping (TOP / BOTTOM / ONEPIECE)
-df_g3 = pd.read_csv(LABELS_G3_CSV)
-assert "garment_3class" in df_g3.columns or "g3_label" in df_g3.columns, \
-    "wash_labels_with_garment.csv must contain garment_3class/g3_label columns"
-
-if "g3_label" in df_g3.columns:
-    df_g3["g3_label"] = df_g3["g3_label"].astype(int)
-    # we reconstruct name mapping from garment_3class if present
-    if "garment_3class" in df_g3.columns:
-        g3_map = (df_g3.drop_duplicates("g3_label")
-                        .set_index("g3_label")["garment_3class"]
-                        .to_dict())
-    else:
-        # fallback: anything that maps to the 3 labels
-        g3_map = {int(i): f"CLASS_{i}" for i in sorted(df_g3["g3_label"].unique())}
-else:
-    # If only names exist, create indices
-    df_g3["garment_3class"] = df_g3["garment_3class"].astype(str)
-    classes = sorted(df_g3["garment_3class"].unique())
-    name2idx = {c: i for i, c in enumerate(classes)}
-    df_g3["g3_label"] = df_g3["garment_3class"].map(name2idx).astype(int)
-    g3_map = {i: c for c, i in name2idx.items()}
-
-num_g3_classes = len(g3_map)
-
 wash_description = {
     "delicate": "Delicate – gentle wash, cold water, low spin (silk, lace, sensitive fabrics).",
     "normal":   "Normal – standard wash, warm water, medium spin (daily cotton & mixed clothes).",
     "heavy":    "Heavy – deep-clean, hot water, high spin (jeans, towels, sportswear).",
     "quick":    "Quick – rapid wash, cool water, medium spin (lightly soiled garments).",
-    "wool":     "Wool – wool cycle, cool water, very low spin (prevents shrinkage).",
+    "wool":     "Wool – wool-safe cycle, cool water, very low spin (prevents shrinkage).",
 }
 
+# ==========================================================
+# 2) Garment 3-class mapping (from your training code)
+# ==========================================================
+# keep_classes = ["TOP", "BOTTOM", "ONEPIECE"]
+# CLASS2IDX    = {name: i for i, name in enumerate(sorted(keep_classes))}
+# sorted(keep_classes) = ["BOTTOM", "ONEPIECE", "TOP"]
+# => BOTTOM:0, ONEPIECE:1, TOP:2
 
-# --------------------------------------------------
-# 2) Transforms
-# --------------------------------------------------
-IMG_SIZE = 224   # to match your G3ConvNeXt training
+G3_IDX2CLASS = {
+    0: "BOTTOM",
+    1: "ONEPIECE",
+    2: "TOP",
+}
+num_g3_classes = len(G3_IDX2CLASS)
+
+
+# ==========================================================
+# 3) Transforms and device
+# ==========================================================
+IMG_SIZE = 224  # same as in your training script
+
 demo_transform = transforms.Compose([
     transforms.Resize(IMG_SIZE + 16),
     transforms.CenterCrop(IMG_SIZE),
@@ -118,14 +106,14 @@ demo_transform = transforms.Compose([
 ])
 
 BACKBONE = "convnext_tiny"
-device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+device   = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 
-# --------------------------------------------------
-# 3) Model definitions – must match training
-# --------------------------------------------------
+# ==========================================================
+# 4) Model definitions (must match training)
+# ==========================================================
 class WashMultiTaskConvNeXt(nn.Module):
-    """Color, Fabric, Wash Program (your multitask model)."""
+    """Color, Fabric, Wash Program."""
     def __init__(self, n_color, n_fabric, n_wash):
         super().__init__()
         self.backbone = timm.create_model(
@@ -149,13 +137,7 @@ class WashMultiTaskConvNeXt(nn.Module):
 
 
 class G3ConvNeXt(nn.Module):
-    """
-    EXACT copy of your training model for 3-class garment:
-    - pretrained ConvNeXt-Tiny
-    - global_pool='avg'
-    - Dropout(0.2)
-    - Linear -> 3 classes
-    """
+    """3-class garment classifier: BOTTOM / ONEPIECE / TOP."""
     def __init__(self, model_name="convnext_tiny", num_classes=3, dropout=0.2):
         super().__init__()
         self.backbone = timm.create_model(
@@ -165,7 +147,7 @@ class G3ConvNeXt(nn.Module):
             global_pool="avg",
         )
         self.dropout = nn.Dropout(dropout)
-        self.fc = nn.Linear(self.backbone.num_features, num_classes)
+        self.fc      = nn.Linear(self.backbone.num_features, num_classes)
 
     def forward(self, x):
         feat = self.backbone(x)
@@ -173,11 +155,11 @@ class G3ConvNeXt(nn.Module):
         return self.fc(feat)
 
 
-# --------------------------------------------------
-# 4) Load weights
-# --------------------------------------------------
-download_if_missing(MODEL_URL_WASH,     CKPT_WASH,     "wash (color/fabric/wash)")
-download_if_missing(MODEL_URL_GARMENT3, CKPT_GARMENT_3, "garment 3-class")
+# ==========================================================
+# 5) Load weights
+# ==========================================================
+download_if_missing(MODEL_URL_WASH, CKPT_WASH, "wash (color/fabric/wash)")
+download_if_missing(MODEL_URL_G3,   CKPT_G3,   "garment 3-class")
 
 wash_model = WashMultiTaskConvNeXt(
     n_color=num_color_classes,
@@ -187,17 +169,16 @@ wash_model = WashMultiTaskConvNeXt(
 wash_model.load_state_dict(torch.load(CKPT_WASH, map_location=device))
 wash_model.eval()
 
-g3_model = G3ConvNeXt(
-    num_classes=num_g3_classes,
-).to(device)
-g3_model.load_state_dict(torch.load(CKPT_GARMENT_3, map_location=device))
+g3_model = G3ConvNeXt(num_classes=num_g3_classes).to(device)
+g3_model.load_state_dict(torch.load(CKPT_G3, map_location=device))
 g3_model.eval()
 
 
-# --------------------------------------------------
-# 5) Prediction helper
-# --------------------------------------------------
+# ==========================================================
+# 6) Prediction helper
+# ==========================================================
 def predict_all(pil_img: Image.Image):
+    """Run both models and return predictions as strings."""
     x = demo_transform(pil_img).unsqueeze(0).to(device)
 
     with torch.no_grad():
@@ -207,24 +188,24 @@ def predict_all(pil_img: Image.Image):
         f_idx = logits_f.argmax(1).item()
         w_idx = logits_w.argmax(1).item()
 
-        # 3-class garment model
-        logits_g3 = g3_model(x)
-        g3_idx = logits_g3.argmax(1).item()
+        # garment 3-class model
+        logits_g = g3_model(x)
+        g_idx = logits_g.argmax(1).item()
 
     wash_key  = wash_map[w_idx]
     wash_text = wash_description.get(wash_key, wash_key)
 
     return {
-        "garment": g3_map[g3_idx],
+        "garment": G3_IDX2CLASS[g_idx],
         "color":   color_map[c_idx],
         "fabric":  fabric_map[f_idx],
         "wash":    wash_text,
     }
 
 
-# --------------------------------------------------
-# 6) Streamlit app
-# --------------------------------------------------
+# ==========================================================
+# 7) Streamlit UI
+# ==========================================================
 def main():
     st.set_page_config(
         page_title="ai-laundry-sorter",
@@ -255,7 +236,7 @@ def main():
         result = predict_all(pil)
 
         with col2:
-            st.subheader("Prediction")
+            st.subheader("Washing Recommendation")
             st.markdown(f"**Garment Type:** {result['garment']}")
             st.markdown(f"**Color Group:** {result['color']}")
             st.markdown(f"**Fabric Group:** {result['fabric']}")
