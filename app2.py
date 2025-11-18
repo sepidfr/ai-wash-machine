@@ -1,7 +1,7 @@
 """
 AI Laundry Sorter – Streamlit Demo
 Loads multitask ConvNeXt (color, fabric, wash program)
-Model weights come from Google Drive.
+Checkpoint is downloaded from Google Drive.
 """
 
 import os
@@ -18,50 +18,72 @@ import timm
 import gdown
 import streamlit as st
 
-# --------------------------------------------
-# 0) Paths and Google Drive download
-# --------------------------------------------
-
-LABELS_CSV = "wash_labels.csv"        # in your repo
-HEADER_IMG = "ai.jpg"                 # header picture
-CKPT_PATH  = "best_model_wash.pt"     # will be downloaded
+# ------------------------------------------------------------
+# 0) Paths + Google Drive download
+# ------------------------------------------------------------
+LABELS_CSV = "wash_labels.csv"       # in repo
+HEADER_IMG = "ai.jpg"                # in repo
+CKPT_PATH  = "best_model_wash.pt"    # downloaded here
 DEMO_LOG   = "demo_usage_log.csv"
 
 MODEL_URL_WASH = "https://drive.google.com/uc?id=1y5wTHMGzfHasvNMEilpWgNw-A9o9Olmm"
 
 
-def download_if_missing(url: str, dest: str, what: str = "model file"):
+def download_if_missing(url: str, dest: str, what: str = "file"):
     if os.path.exists(dest):
         return
     st.write(f"Downloading {what} from Google Drive...")
     try:
         gdown.download(url, dest, quiet=False)
     except Exception as e:
-        st.error(f"Failed to download {what} from Google Drive.\n\nError: {e}")
+        st.error(f"Failed to download {what} from Google Drive.\n\n{e}")
         st.stop()
 
 
+st.write("Downloading wash-model checkpoint from Google Drive...")
 download_if_missing(MODEL_URL_WASH, CKPT_PATH, "wash-model checkpoint")
 
-# --------------------------------------------
-# 1) Load checkpoint FIRST and infer #classes
-# --------------------------------------------
-
-# load only on CPU to inspect shapes
+# ------------------------------------------------------------
+# 1) Load checkpoint and infer #classes (robust to 'module.')
+# ------------------------------------------------------------
 raw_state = torch.load(CKPT_PATH, map_location="cpu")
 
-# these keys MUST match names used during training
-num_color_classes  = raw_state["head_color.weight"].shape[0]
-num_fabric_classes = raw_state["head_fabric.weight"].shape[0]
-num_wash_classes   = raw_state["head_wash_cycle.weight"].shape[0]
+def find_head_key(state, base_name: str) -> str:
+    """Find a key ending with '<base_name>.weight' (handles 'module.' prefix)."""
+    target_suffix = base_name + ".weight"
+    for k in state.keys():
+        if k.endswith(target_suffix):
+            return k
+    raise KeyError(
+        f"Could not find weight for '{base_name}' in checkpoint. "
+        f"Example keys: {list(state.keys())[:10]}"
+    )
 
-print("Classes from checkpoint:",
-      num_color_classes, num_fabric_classes, num_wash_classes)
+k_color  = find_head_key(raw_state, "head_color")
+k_fabric = find_head_key(raw_state, "head_fabric")
+k_wash   = find_head_key(raw_state, "head_wash_cycle")
 
-# --------------------------------------------
-# 2) Label metadata from CSV (for pretty names)
-# --------------------------------------------
+num_color_classes  = raw_state[k_color].shape[0]
+num_fabric_classes = raw_state[k_fabric].shape[0]
+num_wash_classes   = raw_state[k_wash].shape[0]
 
+# strip 'module.' prefix if it exists
+def strip_module_prefix(state):
+    if not any(k.startswith("module.") for k in state.keys()):
+        return state
+    new_state = {}
+    for k, v in state.items():
+        if k.startswith("module."):
+            new_state[k[len("module."):]] = v
+        else:
+            new_state[k] = v
+    return new_state
+
+adapted_state = strip_module_prefix(raw_state)
+
+# ------------------------------------------------------------
+# 2) Label metadata from CSV (pretty names)
+# ------------------------------------------------------------
 df_all = pd.read_csv(LABELS_CSV)
 
 df_all["color_label"]      = df_all["color_label"].astype(int)
@@ -73,22 +95,16 @@ fabric_map = dict(zip(df_all["fabric_label"], df_all["fabric_group"]))
 wash_map   = dict(zip(df_all["wash_cycle_label"], df_all["wash_cycle"]))
 
 wash_full_description = {
-    "delicate": "Delicate – gentle wash, cold water, low spin "
-                "(ideal for silk and sensitive fabrics).",
-    "normal":   "Normal – standard wash, 40°C warm water, medium spin "
-                "(daily cotton & mixed clothes).",
-    "heavy":    "Heavy – deep clean, 60°C hot water, high spin "
-                "(jeans, towels, sportswear).",
-    "quick":    "Quick – short cycle, 30°C cool water, medium spin "
-                "(lightly-soiled clothes).",
-    "wool":     "Wool – special wool cycle, 30°C cold, ultra-low spin "
-                "(prevents shrinkage).",
+    "delicate": "Delicate – gentle wash, cold water, low spin (ideal for silk and sensitive fabrics).",
+    "normal":   "Normal – standard wash, 40°C warm water, medium spin (daily cotton & mixed clothes).",
+    "heavy":    "Heavy – deep clean, 60°C hot water, high spin (jeans, towels, sportswear).",
+    "quick":    "Quick – short cycle, 30°C cool water, medium spin (lightly-soiled clothes).",
+    "wool":     "Wool – special wool cycle, 30°C cold, ultra-low spin (prevents shrinkage).",
 }
 
-# --------------------------------------------
-# 3) Model definition (must match training)
-# --------------------------------------------
-
+# ------------------------------------------------------------
+# 3) Model definition
+# ------------------------------------------------------------
 IMG_SIZE = 256
 BACKBONE_NAME = "convnext_tiny"
 
@@ -99,7 +115,6 @@ demo_transform = transforms.Compose([
     transforms.Normalize([0.485, 0.456, 0.406],
                          [0.229, 0.224, 0.225]),
 ])
-
 
 class WashMultiTaskConvNeXt(nn.Module):
     def __init__(self, num_color: int, num_fabric: int, num_wash: int):
@@ -117,29 +132,25 @@ class WashMultiTaskConvNeXt(nn.Module):
 
     def forward(self, x):
         feat = self.backbone(x)
-        return (
-            self.head_color(feat),
-            self.head_fabric(feat),
-            self.head_wash_cycle(feat),
-        )
-
+        logits_c = self.head_color(feat)
+        logits_f = self.head_fabric(feat)
+        logits_w = self.head_wash_cycle(feat)
+        return logits_c, logits_f, logits_w
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-
 model = WashMultiTaskConvNeXt(
     num_color=num_color_classes,
     num_fabric=num_fabric_classes,
     num_wash=num_wash_classes,
 ).to(device)
 
-# now load the FULL state dict strictly: shapes match by construction
-model.load_state_dict(raw_state)
+# now shapes and names should match
+model.load_state_dict(adapted_state)
 model.eval()
 
-# --------------------------------------------
+# ------------------------------------------------------------
 # 4) Prediction helper
-# --------------------------------------------
-
+# ------------------------------------------------------------
 def predict_single_image(pil_img: Image.Image):
     x = demo_transform(pil_img).unsqueeze(0).to(device)
     with torch.no_grad():
@@ -158,10 +169,9 @@ def predict_single_image(pil_img: Image.Image):
         "wash":   wash_text,
     }
 
-# --------------------------------------------
+# ------------------------------------------------------------
 # 5) Streamlit UI
-# --------------------------------------------
-
+# ------------------------------------------------------------
 def main():
     st.set_page_config(
         page_title="AI Laundry Sorter",
@@ -200,7 +210,7 @@ def main():
         st.markdown(f"**Fabric Group:** {result['fabric']}")
         st.markdown(f"**Wash Program:** {result['wash']}")
 
-    # simple logging (optional)
+    # simple log
     ts = datetime.datetime.now().isoformat(timespec="seconds")
     row = pd.DataFrame([{
         "timestamp": ts,
@@ -216,7 +226,6 @@ def main():
         row.to_csv(DEMO_LOG, index=False)
 
     st.success("Prediction logged.")
-
 
 if __name__ == "__main__":
     main()
