@@ -21,11 +21,12 @@ import streamlit as st
 # ------------------------------------------------------------
 # 0) Paths + Google Drive download
 # ------------------------------------------------------------
-LABELS_CSV = "wash_labels.csv"       # in repo
-HEADER_IMG = "ai.jpg"                # in repo
+LABELS_CSV = "wash_labels.csv"       # this file is in your GitHub repo
+HEADER_IMG = "ai.jpg"                # project banner (optional)
 CKPT_PATH  = "best_model_wash.pt"    # downloaded here
 DEMO_LOG   = "demo_usage_log.csv"
 
+# your Drive link converted to `uc?id=...`
 MODEL_URL_WASH = "https://drive.google.com/uc?id=1y5wTHMGzfHasvNMEilpWgNw-A9o9Olmm"
 
 
@@ -44,51 +45,36 @@ st.write("Downloading wash-model checkpoint from Google Drive...")
 download_if_missing(MODEL_URL_WASH, CKPT_PATH, "wash-model checkpoint")
 
 # ------------------------------------------------------------
-# 1) Load checkpoint and infer #classes (robust to 'module.')
+# 1) Load checkpoint (only fix 'module.' prefix if needed)
 # ------------------------------------------------------------
 raw_state = torch.load(CKPT_PATH, map_location="cpu")
 
-def find_head_key(state, base_name: str) -> str:
-    """Find a key ending with '<base_name>.weight' (handles 'module.' prefix)."""
-    target_suffix = base_name + ".weight"
-    for k in state.keys():
-        if k.endswith(target_suffix):
-            return k
-    raise KeyError(
-        f"Could not find weight for '{base_name}' in checkpoint. "
-        f"Example keys: {list(state.keys())[:10]}"
-    )
-
-k_color  = find_head_key(raw_state, "head_color")
-k_fabric = find_head_key(raw_state, "head_fabric")
-k_wash   = find_head_key(raw_state, "head_wash_cycle")
-
-num_color_classes  = raw_state[k_color].shape[0]
-num_fabric_classes = raw_state[k_fabric].shape[0]
-num_wash_classes   = raw_state[k_wash].shape[0]
-
-# strip 'module.' prefix if it exists
-def strip_module_prefix(state):
-    if not any(k.startswith("module.") for k in state.keys()):
-        return state
+def strip_module_prefix(state_dict):
+    """Remove 'module.' prefix when the model was trained with DataParallel."""
+    if not any(k.startswith("module.") for k in state_dict.keys()):
+        return state_dict
     new_state = {}
-    for k, v in state.items():
+    for k, v in state_dict.items():
         if k.startswith("module."):
             new_state[k[len("module."):]] = v
         else:
             new_state[k] = v
     return new_state
 
-adapted_state = strip_module_prefix(raw_state)
+state_dict = strip_module_prefix(raw_state)
 
 # ------------------------------------------------------------
-# 2) Label metadata from CSV (pretty names)
+# 2) Label metadata from CSV  (we use this to know #classes)
 # ------------------------------------------------------------
 df_all = pd.read_csv(LABELS_CSV)
 
 df_all["color_label"]      = df_all["color_label"].astype(int)
 df_all["fabric_label"]     = df_all["fabric_label"].astype(int)
 df_all["wash_cycle_label"] = df_all["wash_cycle_label"].astype(int)
+
+num_color_classes  = df_all["color_label"].nunique()
+num_fabric_classes = df_all["fabric_label"].nunique()
+num_wash_classes   = df_all["wash_cycle_label"].nunique()
 
 color_map  = dict(zip(df_all["color_label"],  df_all["color_group"]))
 fabric_map = dict(zip(df_all["fabric_label"], df_all["fabric_group"]))
@@ -144,8 +130,8 @@ model = WashMultiTaskConvNeXt(
     num_wash=num_wash_classes,
 ).to(device)
 
-# now shapes and names should match
-model.load_state_dict(adapted_state)
+# load weights (now names should match thanks to strip_module_prefix)
+model.load_state_dict(state_dict)
 model.eval()
 
 # ------------------------------------------------------------
@@ -210,7 +196,6 @@ def main():
         st.markdown(f"**Fabric Group:** {result['fabric']}")
         st.markdown(f"**Wash Program:** {result['wash']}")
 
-    # simple log
     ts = datetime.datetime.now().isoformat(timespec="seconds")
     row = pd.DataFrame([{
         "timestamp": ts,
